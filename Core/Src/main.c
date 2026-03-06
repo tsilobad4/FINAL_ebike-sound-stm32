@@ -56,6 +56,15 @@ uint32_t last_rpm_time_ms = 0;
 uint32_t last_pulse_count = 0;
 volatile float freq_out = 150.0f;   // Hz
 volatile float vol_out  = 0.0f;     // 0..1
+
+// audio streaming code
+// audio buffer varaibles, what the DMA will play
+#define AUDIO_FS   32000.0f			   // sample rate
+#define FRAMES     256                 // stereo frames (even)
+int16_t i2s_tx[FRAMES * 2];            // interleaved L,R : the actual samples that the DMA sends out
+volatile float phase = 0.0f;
+
+volatile uint32_t i2s_half = 0, i2s_full = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -76,6 +85,37 @@ int _write(int file, char *ptr, int len)
 {
   HAL_UART_Transmit(&huart2, (uint8_t*)ptr, len, HAL_MAX_DELAY);
   return len;
+}
+
+// filling the buffer with audio samples
+// creating a beep to see if the DAC is alive
+static void FillAudioFrames(int startFrame, int frameCount)
+{
+  // Flip between two frequencies every 2 seconds
+  static uint32_t last_flip_ms = 0;
+  static float test_freq = 500.0f;      // start tone
+  const float test_vol = 0.20f;         // safe volume
+
+  uint32_t now = HAL_GetTick();
+  if (now - last_flip_ms >= 2000) {
+    last_flip_ms = now;
+    test_freq = (test_freq == 500.0f) ? 1500.0f : 500.0f;
+  }
+
+  for (int n = 0; n < frameCount; n++)
+  {
+    phase += (test_freq / AUDIO_FS);
+    if (phase >= 1.0f) phase -= 1.0f;
+
+    // triangle wave [-1..+1]
+    float x = (phase < 0.5f) ? (phase * 4.0f - 1.0f) : (3.0f - phase * 4.0f);
+
+    int16_t sample = (int16_t)(x * test_vol * 30000.0f);
+
+    int idx = (startFrame + n) * 2;
+    i2s_tx[idx + 0] = sample;   // Left
+    i2s_tx[idx + 1] = sample;   // Right
+  }
 }
 
 /* USER CODE END 0 */
@@ -114,6 +154,14 @@ int main(void)
   MX_ADC1_Init();
   MX_I2S2_Init();
   /* USER CODE BEGIN 2 */
+
+  // starting the DMA
+  FillAudioFrames(0, FRAMES);
+
+
+  HAL_I2S_Transmit_DMA(&hi2s2, (uint16_t*)i2s_tx, FRAMES * 2);			// start streaming this bugger out of I2S2 forever using DMA
+
+
 
   /* USER CODE END 2 */
 
@@ -154,11 +202,17 @@ int main(void)
 	        uint32_t f_out_int = (uint32_t)(freq_out + 0.5f);      // rounded Hz
 	        uint32_t v_out_pct = (uint32_t)(vol_out * 100.0f + 0.5f); // 0..100%
 
-	        printf("RPM:%lu | Thr:%lu%% | f_out:%lu Hz | v_out:%lu%%\r\n",
-	               (uint32_t)rpm_filtered,
-	               throttle_percent,
-	               f_out_int,
-	               v_out_pct);
+//	        printf("RPM:%lu | Thr:%lu%% | f_out:%lu Hz | v_out:%lu%%\r\n",
+//	               (uint32_t)rpm_filtered,
+//	               throttle_percent,
+//	               f_out_int,
+//	               v_out_pct);
+	    }
+
+	    static uint32_t last_print = 0;
+	    if (HAL_GetTick() - last_print >= 1000) {
+	      last_print = HAL_GetTick();
+	      printf("i2s_half=%lu i2s_full=%lu\r\n", i2s_half, i2s_full);
 	    }
 
 //	    HAL_Delay(5); // tiny delay so UART isn't spammed
@@ -409,6 +463,23 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) 	//Every time PA4 goes from low t
   if (GPIO_Pin == RPM_INPUT_Pin)
   {
     pulse_count++;
+  }
+}
+
+//DMA callbacks, keeping audio continuous
+void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s)
+{
+  if (hi2s->Instance == SPI2) {
+    i2s_half++;
+    FillAudioFrames(0, FRAMES/2);
+  }
+}
+
+void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s)
+{
+  if (hi2s->Instance == SPI2) {
+    i2s_full++;
+    FillAudioFrames(FRAMES/2, FRAMES/2);
   }
 }
 
