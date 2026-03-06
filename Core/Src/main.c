@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include <math.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -65,6 +66,7 @@ int16_t i2s_tx[FRAMES * 2];            // interleaved L,R : the actual samples t
 volatile float phase = 0.0f;
 
 volatile uint32_t i2s_half = 0, i2s_full = 0;
+#define TWO_PI 6.283185307f
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -87,34 +89,49 @@ int _write(int file, char *ptr, int len)
   return len;
 }
 
-// filling the buffer with audio samples
-// creating a beep to see if the DAC is alive
+//the pitch being set by the RPM
 static void FillAudioFrames(int startFrame, int frameCount)
 {
-  // Flip between two frequencies every 2 seconds
-  static uint32_t last_flip_ms = 0;
-  static float test_freq = 500.0f;      // start tone
-  const float test_vol = 0.20f;         // safe volume
+  const float two_pi = 6.283185307f;
 
-  uint32_t now = HAL_GetTick();
-  if (now - last_flip_ms >= 2000) {
-    last_flip_ms = now;
-    test_freq = (test_freq == 500.0f) ? 1500.0f : 500.0f;
-  }
+  // Map RPM -> low pitch with more spread
+  // (Adjust these two numbers to taste)
+  float rpm = rpm_filtered;                 // your filtered RPM
+  float f_target = 30.0f + 0.012f * rpm;    // 0 RPM->30Hz, 10k RPM->150Hz
+
+  // Wider low band so changes are audible
+  if (f_target < 25.0f)  f_target = 25.0f;
+  if (f_target > 400.0f) f_target = 400.0f;
+
+  // Smooth at audio-rate
+  static float f_smooth = 60.0f;
+  f_smooth += 0.0020f * (f_target - f_smooth);
+  float f = f_smooth;
+
+  const float vol = 0.22f;
+
+  static float ph1 = 0.0f, ph2 = 0.0f, ph3 = 0.0f;
 
   for (int n = 0; n < frameCount; n++)
   {
-    phase += (test_freq / AUDIO_FS);
-    if (phase >= 1.0f) phase -= 1.0f;
+    ph1 += f / AUDIO_FS;          if (ph1 >= 1.0f) ph1 -= 1.0f;
+    ph2 += (2.0f * f) / AUDIO_FS; if (ph2 >= 1.0f) ph2 -= 1.0f;
+    ph3 += (3.0f * f) / AUDIO_FS; if (ph3 >= 1.0f) ph3 -= 1.0f;
 
-    // triangle wave [-1..+1]
-    float x = (phase < 0.5f) ? (phase * 4.0f - 1.0f) : (3.0f - phase * 4.0f);
+    float s1 = sinf(two_pi * ph1);
+    float s2 = sinf(two_pi * ph2);
+    float s3 = sinf(two_pi * ph3);
 
-    int16_t sample = (int16_t)(x * test_vol * 30000.0f);
+    float x = 0.92f*s1 + 0.06f*s2 + 0.02f*s3;
+
+    float ax = (x < 0) ? -x : x;
+    x = x / (1.0f + 0.6f*ax);
+
+    int16_t sample = (int16_t)(x * vol * 30000.0f);
 
     int idx = (startFrame + n) * 2;
-    i2s_tx[idx + 0] = sample;   // Left
-    i2s_tx[idx + 1] = sample;   // Right
+    i2s_tx[idx + 0] = sample;
+    i2s_tx[idx + 1] = sample;
   }
 }
 
@@ -177,9 +194,9 @@ int main(void)
 
 	    uint32_t throttle_percent = (adc * 100) / 4095;
 
-	    // --- compute RPM once per 200- ms (non-blocking) ---
+	    // --- compute RPM once per 20- ms (non-blocking) ---
 	    uint32_t now = HAL_GetTick();
-	    if (now - last_rpm_time_ms >= 200)
+	    if (now - last_rpm_time_ms >= 20)
 	    {
 	        last_rpm_time_ms = now;
 
@@ -192,8 +209,12 @@ int main(void)
 
 	        //defining the control values
 	        // 1) compute targets (raw)
-	        float freq_target = 80.0f + 0.04f * rpm_filtered;
+	       	float freq_target = 200.0f + 0.06f * rpm_filtered;
 	        float vol_target  = (float)throttle_percent / 100.0f;  // 0..1
+
+	        //clamping
+	        if (freq_target < 200.0f) freq_target = 200.0f;
+	        if (freq_target > 2000.0f) freq_target = 2000.0f;
 
 	        // 2) smooth outputs (keep old + move toward target)
 	        freq_out = 0.9f * freq_out + 0.1f * freq_target;
@@ -202,20 +223,20 @@ int main(void)
 	        uint32_t f_out_int = (uint32_t)(freq_out + 0.5f);      // rounded Hz
 	        uint32_t v_out_pct = (uint32_t)(vol_out * 100.0f + 0.5f); // 0..100%
 
-//	        printf("RPM:%lu | Thr:%lu%% | f_out:%lu Hz | v_out:%lu%%\r\n",
-//	               (uint32_t)rpm_filtered,
-//	               throttle_percent,
-//	               f_out_int,
-//	               v_out_pct);
+	        printf("RPM:%lu | Thr:%lu%% | f_out:%lu Hz | v_out:%lu%%\r\n",
+	               (uint32_t)rpm_filtered,
+	               throttle_percent,
+	               f_out_int,
+	               v_out_pct);
 	    }
+//
+//	    static uint32_t last_print = 0;
+//	    if (HAL_GetTick() - last_print >= 1000) {
+//	      last_print = HAL_GetTick();
+//	      printf("i2s_half=%lu i2s_full=%lu\r\n", i2s_half, i2s_full);
+//	    }
 
-	    static uint32_t last_print = 0;
-	    if (HAL_GetTick() - last_print >= 1000) {
-	      last_print = HAL_GetTick();
-	      printf("i2s_half=%lu i2s_full=%lu\r\n", i2s_half, i2s_full);
-	    }
-
-//	    HAL_Delay(5); // tiny delay so UART isn't spammed
+	    HAL_Delay(5); // tiny delay so UART isn't spammed
 
 
     /* USER CODE END WHILE */
