@@ -57,6 +57,7 @@ uint32_t last_rpm_time_ms = 0;
 uint32_t last_pulse_count = 0;
 volatile float freq_out = 150.0f;   // Hz
 volatile float vol_out  = 0.0f;     // 0..1
+volatile float throttle_val = 0.0f; // 0.0 to 1.0 scale
 
 // audio streaming code
 // audio buffer varaibles, what the DMA will play
@@ -93,43 +94,56 @@ int _write(int file, char *ptr, int len)
 static void FillAudioFrames(int startFrame, int frameCount)
 {
   const float two_pi = 6.283185307f;
+
+  // Local copies of global volatiles for thread safety during this frame
   float f = freq_out;
-  float vol = vol_out; // Dynamic volume
+  float base_vol = vol_out;
+  float t_val = throttle_val;
 
-  // Electric cars need a higher range for that "whine"
-  if (f < 20.0f) f = 20.0f; // This allows a much deeper hum
-  if (f > 1200.0f) f = 1200.0f; // Increased cap for higher pitch
+  // 1. Safety Clamps
+  if (f < 20.0f) f = 20.0f;
+  if (f > 1200.0f) f = 1200.0f;
 
-  // We need more phase trackers for the high harmonics
+  // Persistent phase trackers
   static float ph1 = 0.0f, ph2 = 0.0f, ph3 = 0.0f, ph4 = 0.0f, ph8 = 0.0f;
+  static float wobble_phase = 0.0f;
 
   for (int n = 0; n < frameCount; n++)
   {
-    // Fundamental + Harmonics
+    // 2. GENERATE HARMONICS (The Timbre)
+    // Increments phase based on frequency and sample rate
     ph1 += f / AUDIO_FS;          if (ph1 >= 1.0f) ph1 -= 1.0f;
     ph2 += (2.0f * f) / AUDIO_FS; if (ph2 >= 1.0f) ph2 -= 1.0f;
     ph3 += (3.0f * f) / AUDIO_FS; if (ph3 >= 1.0f) ph3 -= 1.0f;
-    ph4 += (4.0f * f) / AUDIO_FS; if (ph4 >= 1.0f) ph4 -= 1.0f; // Added 4th
-    ph8 += (8.0f * f) / AUDIO_FS; if (ph8 >= 1.0f) ph8 -= 1.0f; // High frequency whirr
+    ph4 += (4.0f * f) / AUDIO_FS; if (ph4 >= 1.0f) ph4 -= 1.0f;
+    ph8 += (8.0f * f) / AUDIO_FS; if (ph8 >= 1.0f) ph8 -= 1.0f;
 
-    float s1 = sinf(two_pi * ph1);
-    float s2 = sinf(two_pi * ph2);
-    float s3 = sinf(two_pi * ph3);
-    float s4 = sinf(two_pi * ph4);
-    float s8 = sinf(two_pi * ph8);
+    // Mixing the "Heavenly" additive blend
+    float x = 0.70f*sinf(two_pi*ph1) +
+              0.15f*sinf(two_pi*ph2) +
+              0.05f*sinf(two_pi*ph3) +
+              0.05f*sinf(two_pi*ph4) +
+              0.05f*sinf(two_pi*ph8);
 
-    // Mix for a "Clean/Heavenly" sound:
-    // Lots of fundamental (s1) for the base, s4 and s8 for the electric "whine"
-    float x = 0.70f*s1 + 0.15f*s2 + 0.05f*s3 + 0.05f*s4 + 0.05f*s8;
+    // 3. THE WOBBLE (Amplitude Modulation)
+    // Speed reacts to throttle (5Hz to 25Hz)
+    float wobble_freq = 5.0f + (t_val * 20.0f);
+    wobble_phase += wobble_freq / AUDIO_FS;
+    if (wobble_phase >= 1.0f) wobble_phase -= 1.0f;
 
-    // NO DISTORTION HERE - keeping the sine waves pure
-    int16_t sample = (int16_t)(x * vol * 28000.0f);
+    // Depth: creates a subtle "electric load" pulsing effect
+    float modulation = 1.0f - (0.2f * (0.5f + 0.5f * sinf(two_pi * wobble_phase)));
+
+    // 4. FINAL OUTPUT (Scaled to 16-bit PCM range)
+    int16_t sample = (int16_t)(x * base_vol * modulation * 28000.0f);
 
     int idx = (startFrame + n) * 2;
-    i2s_tx[idx + 0] = sample;
-    i2s_tx[idx + 1] = sample;
+    i2s_tx[idx + 0] = sample; // Left Channel
+    i2s_tx[idx + 1] = sample; // Right Channel
   }
 }
+
+
 
 /* USER CODE END 0 */
 
@@ -182,87 +196,54 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-      /* --- BIKE RPM CALCULATION (46 TICKS/REV) --- */
-      uint32_t now = HAL_GetTick();
-      if (now - last_rpm_time_ms >= 20)
-      {
-          last_rpm_time_ms = now;
+	  // 1. THE AUTO-RESTART WATCHDOG
+	        if (HAL_I2S_GetState(&hi2s2) != HAL_I2S_STATE_BUSY_TX)
+	        {
+	            HAL_I2S_Transmit_DMA(&hi2s2, (uint16_t*)i2s_tx, FRAMES * 2);
+	        }
 
-          uint32_t current = pulse_count;
-          float delta = (float)(current - last_pulse_count);
-          last_pulse_count = current;
+	        // 2. READ THROTTLE (ADC) - Do this every loop
+	        HAL_ADC_Start(&hadc1);
+	        if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
+	        {
+	            uint32_t adc_raw = HAL_ADC_GetValue(&hadc1);
 
-          // 1. Calculate REAL RPM: (delta pulses / 46 ticks) * 3000
-          // We use 3000.0f because (1 / 0.02 seconds) * 60 seconds = 3000
-          float rpm_actual = (delta * 3000.0f) / 46.0f;
+	            // Map 0-4095 to 0.0-1.0
+	            float target_throttle = (float)adc_raw / 4095.0f;
 
-          // 2. Smooth the filter (0.92 keeps it steady, 0.08 reacts to changes)
-          rpm_filtered = 0.92f * rpm_filtered + 0.08f * rpm_actual;
+	            // Smooth the throttle_val so the "wobble" and volume change smoothly
+	            throttle_val = (0.9f * throttle_val) + (0.1f * target_throttle);
 
-          // 3. Adjust Pitch (Freq)
-          // We start at 20Hz (Deep Hum) and add 0.2Hz per RPM
-          // You might want to play with the 0.2f to find your "heavenly" sweet spot
-          freq_out = 20.0f + (rpm_filtered * 0.2f);
+	            // Set the volume based on throttle (0.1 idle, up to 0.6 full)
+	            vol_out = 0.15f + (throttle_val * 0.45f);
+	        }
+	        HAL_ADC_Stop(&hadc1);
 
-          // 4. The "Rev Limiter"
-          if (freq_out > 1000.0f) freq_out = 1000.0f;
+	        // 3. BIKE RPM & PITCH CALCULATION (Every 20ms)
+	        uint32_t now = HAL_GetTick();
+	        if (now - last_rpm_time_ms >= 20)
+	        {
+	            last_rpm_time_ms = now;
 
-          vol_out = 0.45f; // Constant volume for testing
+	            uint32_t current = pulse_count;
+	            float delta = (float)(current - last_pulse_count);
+	            last_pulse_count = current;
 
-          // Check your Serial Monitor to see the "Real" RPM of the wheel
-          printf("Bike RPM: %d | Freq: %d Hz\r\n", (int)rpm_filtered, (int)freq_out);
-      }
-//	    // --- read throttle (ADC) ---
-//	    HAL_ADC_Start(&hadc1);
-//	    HAL_ADC_PollForConversion(&hadc1, 10);
-//	    uint32_t adc = HAL_ADC_GetValue(&hadc1);
-//	    HAL_ADC_Stop(&hadc1);
-//
-//	    uint32_t throttle_percent = (adc * 100) / 4095;
-//
-//	    // --- compute RPM once per 20- ms (non-blocking) ---
-//	    uint32_t now = HAL_GetTick();
-//	    if (now - last_rpm_time_ms >= 20)
-//	    {
-//	        last_rpm_time_ms = now;
-//
-//	        uint32_t current = pulse_count;
-//	        uint32_t pulses_in_20ms = current - last_pulse_count;  // delta
-//	        last_pulse_count = current;
-//
-//	        uint32_t rpm_raw = pulses_in_20ms * 3000; // 200 ms window => RPM = pulses * 300
-//	       	rpm_filtered = 0.8f * rpm_filtered + 0.2f * (float)rpm_raw; // getting the filtered RPM
-//
-//	        //defining the control values
-//	        // 1) compute targets (raw)
-//	       	float freq_target = 200.0f + 0.06f * rpm_filtered;
-//	        float vol_target  = (float)throttle_percent / 100.0f;  // 0..1
-//
-//	        //clamping
-//	        if (freq_target < 200.0f) freq_target = 200.0f;
-//	        if (freq_target > 2000.0f) freq_target = 2000.0f;
-//
-//	        // 2) smooth outputs (keep old + move toward target)
-//	        freq_out = 0.9f * freq_out + 0.1f * freq_target;
-//	        vol_out  = 0.9f * vol_out  + 0.1f * vol_target;
-//
-//	        uint32_t f_out_int = (uint32_t)(freq_out + 0.5f);      // rounded Hz
-//	        uint32_t v_out_pct = (uint32_t)(vol_out * 100.0f + 0.5f); // 0..100%
-//
-//	        printf("RPM:%lu | Thr:%lu%% | f_out:%lu Hz | v_out:%lu%%\r\n",
-//	               (uint32_t)rpm_filtered,
-//	               throttle_percent,
-//	               f_out_int,
-//	               v_out_pct);
-//	    }
-////
-////	    static uint32_t last_print = 0;
-////	    if (HAL_GetTick() - last_print >= 1000) {
-////	      last_print = HAL_GetTick();
-////	      printf("i2s_half=%lu i2s_full=%lu\r\n", i2s_half, i2s_full);
-////	    }
-//
-	    HAL_Delay(1); // tiny delay so UART isn't spammed
+	            // Convert pulses to RPM (46 ticks per rev)
+	            float rpm_actual = (delta * 3000.0f) / 46.0f;
+	            rpm_filtered = (0.92f * rpm_filtered) + (0.08f * rpm_actual);
+
+	            // Calculate frequency based on filtered RPM PLUS the Throttle Position
+	            // Adding (throttle_val * 150.0f) makes the pitch jump when you twist the grip!
+	            freq_out = 20.0f + (rpm_filtered * 0.2f) + (throttle_val * 150.0f);
+
+	            if (freq_out > 1200.0f) freq_out = 1200.0f; // Slightly higher cap for the extra rev
+
+	            // Print status for debugging
+	            printf("RPM: %d | Freq: %d Hz | Thr: %d%%\r\n",
+	                   (int)rpm_filtered, (int)freq_out, (int)(throttle_val * 100));
+	        }
+	            HAL_Delay(1); // tiny delay so UART isn't spammed
 
 
     /* USER CODE END WHILE */
