@@ -68,6 +68,11 @@ volatile float phase = 0.0f;
 
 volatile uint32_t i2s_half = 0, i2s_full = 0;
 #define TWO_PI 6.283185307f
+
+//adding variables for torque kick
+float throttle_old = 0.0f;
+float bite_factor = 0.0f; // This will track the "punch"
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -94,59 +99,78 @@ int _write(int file, char *ptr, int len)
 static void FillAudioFrames(int startFrame, int frameCount)
 {
   const float two_pi = 6.283185307f;
-
-  // Local copies of global volatiles for thread safety during this frame
   float f = freq_out;
   float base_vol = vol_out;
   float t_val = throttle_val;
 
-  // 1. Safety Clamps
   if (f < 20.0f) f = 20.0f;
   if (f > 1200.0f) f = 1200.0f;
 
-  // Persistent phase trackers
+  // Persistent trackers
+  static float chime_timer = 0.0f;
+  static float ph_c = 0.0f, ph_e = 0.0f, ph_g = 0.0f;
   static float ph1 = 0.0f, ph2 = 0.0f, ph3 = 0.0f, ph4 = 0.0f, ph8 = 0.0f;
+  static float ph_sub = 0.0f, ph1_25 = 0.0f, ph1_5 = 0.0f; // Added ph1_25 here
   static float wobble_phase = 0.0f;
 
   for (int n = 0; n < frameCount; n++)
   {
-    // 2. GENERATE HARMONICS (The Timbre)
-    // Increments phase based on frequency and sample rate
-    ph1 += f / AUDIO_FS;          if (ph1 >= 1.0f) ph1 -= 1.0f;
-    ph2 += (2.0f * f) / AUDIO_FS; if (ph2 >= 1.0f) ph2 -= 1.0f;
-    ph3 += (3.0f * f) / AUDIO_FS; if (ph3 >= 1.0f) ph3 -= 1.0f;
-    ph4 += (4.0f * f) / AUDIO_FS; if (ph4 >= 1.0f) ph4 -= 1.0f;
-    ph8 += (8.0f * f) / AUDIO_FS; if (ph8 >= 1.0f) ph8 -= 1.0f;
+    float x = 0.0f;
 
-    // Mixing the "Heavenly" additive blend
-    float x = 0.70f*sinf(two_pi*ph1) +
-              0.15f*sinf(two_pi*ph2) +
-              0.05f*sinf(two_pi*ph3) +
-              0.05f*sinf(two_pi*ph4) +
-              0.05f*sinf(two_pi*ph8);
+    // --- MODE 1: STARTUP CHIME ---
+    if (chime_timer < 3.0f)
+    {
+      chime_timer += 1.0f / AUDIO_FS;
+      ph_c += 261.63f / AUDIO_FS; if (ph_c >= 1.0f) ph_c -= 1.0f;
+      ph_e += 329.63f / AUDIO_FS; if (ph_e >= 1.0f) ph_e -= 1.0f;
+      ph_g += 391.99f / AUDIO_FS; if (ph_g >= 1.0f) ph_g -= 1.0f;
 
-    // 3. THE WOBBLE (Amplitude Modulation)
-    // Speed reacts to throttle (5Hz to 25Hz)
-    float wobble_freq = 5.0f + (t_val * 20.0f);
-    wobble_phase += wobble_freq / AUDIO_FS;
-    if (wobble_phase >= 1.0f) wobble_phase -= 1.0f;
+      float c_vol = (chime_timer < 0.4f) ? (chime_timer * 2.5f) : (1.0f - ((chime_timer - 0.4f) / 2.6f));
+      float shimmer = 0.85f + 0.15f * sinf(two_pi * chime_timer * 2.0f);
 
-    // Depth: creates a subtle "electric load" pulsing effect
-    float modulation = 1.0f - (0.2f * (0.5f + 0.5f * sinf(two_pi * wobble_phase)));
+      x = (sinf(two_pi * ph_c) + sinf(two_pi * ph_e) + sinf(two_pi * ph_g)) * 0.33f * c_vol * shimmer;
 
-    // 4. FINAL OUTPUT (Scaled to 16-bit PCM range)
-    int16_t sample = (int16_t)(x * base_vol * modulation * 28000.0f);
+      int16_t sample = (int16_t)(x * 25000.0f);
+      int idx = (startFrame + n) * 2;
+      i2s_tx[idx + 0] = sample; i2s_tx[idx + 1] = sample;
+    }
+    // --- MODE 2: MOTOR RUNNING ---
+    else
+    {
+      // 1. Update EVERY phase so we can swap sounds on the fly
+      ph_sub += (0.5f * f) / AUDIO_FS;  if (ph_sub >= 1.0f) ph_sub -= 1.0f;
+      ph1    += f / AUDIO_FS;           if (ph1 >= 1.0f) ph1 -= 1.0f;
+      ph1_25 += (1.25f * f) / AUDIO_FS; if (ph1_25 >= 1.0f) ph1_25 -= 1.0f; // Fix: Added tracking
+      ph1_5  += (1.5f * f) / AUDIO_FS;  if (ph1_5 >= 1.0f) ph1_5 -= 1.0f;
+      ph2    += (2.0f * f) / AUDIO_FS;  if (ph2 >= 1.0f) ph2 -= 1.0f;
+      ph3    += (3.0f * f) / AUDIO_FS;  if (ph3 >= 1.0f) ph3 -= 1.0f;
+      ph4    += (4.0f * f) / AUDIO_FS;  if (ph4 >= 1.0f) ph4 -= 1.0f;
+      ph8    += (8.0f * f) / AUDIO_FS;  if (ph8 >= 1.0f) ph8 -= 1.0f;
 
-    int idx = (startFrame + n) * 2;
-    i2s_tx[idx + 0] = sample; // Left Channel
-    i2s_tx[idx + 1] = sample; // Right Channel
+      // --- OPTION D: THE CHIME-MOTOR (The Angelic Choice) ---
+      float sine_mix = (sinf(two_pi * ph1) + sinf(two_pi * ph1_25) + sinf(two_pi * ph1_5)) * 0.33f;
+
+      // The Sharpness Addition (Sawtooth)
+      float saw_wave = (ph1 * 2.0f) - 1.0f;
+
+      // Crossfade: Sine (Smooth) -> Saw (Aggressive) based on throttle
+      x = (sine_mix * (1.0f - (t_val * 0.45f))) + (saw_wave * (t_val * 0.45f));
+
+      // 3. THE WOBBLE
+      wobble_phase += (5.0f + (t_val * 20.0f)) / AUDIO_FS;
+      if (wobble_phase >= 1.0f) wobble_phase -= 1.0f;
+      float modulation = 1.0f - (0.2f * (0.5f + 0.5f * sinf(two_pi * wobble_phase)));
+
+      // 4. FINAL OUTPUT
+      int16_t sample = (int16_t)(x * base_vol * modulation * 28000.0f);
+      int idx = (startFrame + n) * 2;
+      i2s_tx[idx + 0] = sample; i2s_tx[idx + 1] = sample;
+    }
   }
 }
 
-
-
 /* USER CODE END 0 */
-
+// 1 to 4 v
 /**
   * @brief  The application entry point.
   * @retval int
@@ -207,18 +231,28 @@ int main(void)
 	        if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
 	        {
 	            uint32_t adc_raw = HAL_ADC_GetValue(&hadc1);
-
-	            // Map 0-4095 to 0.0-1.0
 	            float target_throttle = (float)adc_raw / 4095.0f;
 
-	            // Smooth the throttle_val so the "wobble" and volume change smoothly
+	            // Calculate how FAST the throttle is moving (The "Kick")
+	            float throttle_diff = target_throttle - throttle_old;
+	            if (throttle_diff > 0) {
+	                // If twisting UP fast, add bite (scaled by how fast you move)
+	                bite_factor += throttle_diff * 2.5f;
+	            }
+	            throttle_old = target_throttle;
+
+	            // Decay the bite factor back to 0 (the "settle" effect)
+	            bite_factor *= 0.95f;
+	            if (bite_factor > 0.5f) bite_factor = 0.5f; // Cap the boost
+
+	            // Smooth the throttle_val normally
 	            throttle_val = (0.9f * throttle_val) + (0.1f * target_throttle);
 
-	            // Set the volume based on throttle (0.1 idle, up to 0.6 full)
-	            vol_out = 0.15f + (throttle_val * 0.45f);
+	            // Final Volume = Steady volume + the "Bite" boost
+	            vol_out = 0.15f + (throttle_val * 0.45f) + bite_factor;
+	            if (vol_out > 0.9f) vol_out = 0.9f; // Don't clip!
 	        }
 	        HAL_ADC_Stop(&hadc1);
-
 	        // 3. BIKE RPM & PITCH CALCULATION (Every 20ms)
 	        uint32_t now = HAL_GetTick();
 	        if (now - last_rpm_time_ms >= 20)
