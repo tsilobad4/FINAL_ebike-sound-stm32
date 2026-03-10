@@ -93,31 +93,37 @@ int _write(int file, char *ptr, int len)
 static void FillAudioFrames(int startFrame, int frameCount)
 {
   const float two_pi = 6.283185307f;
+  float f = freq_out;
+  float vol = vol_out; // Dynamic volume
 
-  float f = freq_out;          // actual pitch used by audio
-  const float vol = 0.22f;     // constant volume for now
+  // Electric cars need a higher range for that "whine"
+  if (f < 20.0f) f = 20.0f; // This allows a much deeper hum
+  if (f > 1200.0f) f = 1200.0f; // Increased cap for higher pitch
 
-  if (f < 25.0f)  f = 25.0f;
-  if (f > 400.0f) f = 400.0f;
-
-  static float ph1 = 0.0f, ph2 = 0.0f, ph3 = 0.0f;
+  // We need more phase trackers for the high harmonics
+  static float ph1 = 0.0f, ph2 = 0.0f, ph3 = 0.0f, ph4 = 0.0f, ph8 = 0.0f;
 
   for (int n = 0; n < frameCount; n++)
   {
+    // Fundamental + Harmonics
     ph1 += f / AUDIO_FS;          if (ph1 >= 1.0f) ph1 -= 1.0f;
     ph2 += (2.0f * f) / AUDIO_FS; if (ph2 >= 1.0f) ph2 -= 1.0f;
     ph3 += (3.0f * f) / AUDIO_FS; if (ph3 >= 1.0f) ph3 -= 1.0f;
+    ph4 += (4.0f * f) / AUDIO_FS; if (ph4 >= 1.0f) ph4 -= 1.0f; // Added 4th
+    ph8 += (8.0f * f) / AUDIO_FS; if (ph8 >= 1.0f) ph8 -= 1.0f; // High frequency whirr
 
     float s1 = sinf(two_pi * ph1);
     float s2 = sinf(two_pi * ph2);
     float s3 = sinf(two_pi * ph3);
+    float s4 = sinf(two_pi * ph4);
+    float s8 = sinf(two_pi * ph8);
 
-    float x = 0.92f*s1 + 0.06f*s2 + 0.02f*s3;
+    // Mix for a "Clean/Heavenly" sound:
+    // Lots of fundamental (s1) for the base, s4 and s8 for the electric "whine"
+    float x = 0.70f*s1 + 0.15f*s2 + 0.05f*s3 + 0.05f*s4 + 0.05f*s8;
 
-    float ax = (x < 0) ? -x : x;
-    x = x / (1.0f + 0.6f*ax);
-
-    int16_t sample = (int16_t)(x * vol * 20000.0f);
+    // NO DISTORTION HERE - keeping the sine waves pure
+    int16_t sample = (int16_t)(x * vol * 28000.0f);
 
     int idx = (startFrame + n) * 2;
     i2s_tx[idx + 0] = sample;
@@ -176,27 +182,36 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  /* --- NEW DEEP MOTOR CODE START --- */
-	      uint32_t now = HAL_GetTick();
-	      if (now - last_rpm_time_ms >= 20)
-	      {
-	          last_rpm_time_ms = now;
+      /* --- BIKE RPM CALCULATION (46 TICKS/REV) --- */
+      uint32_t now = HAL_GetTick();
+      if (now - last_rpm_time_ms >= 20)
+      {
+          last_rpm_time_ms = now;
 
-	          uint32_t current = pulse_count;
-	          float delta = (float)(current - last_pulse_count);
-	          last_pulse_count = current;
+          uint32_t current = pulse_count;
+          float delta = (float)(current - last_pulse_count);
+          last_pulse_count = current;
 
-	          // Smoother RPM logic (40Hz to 150Hz range)
-	          float rpm_instant = delta * 1500.0f;
-	          rpm_filtered = 0.92f * rpm_filtered + 0.08f * rpm_instant;
+          // 1. Calculate REAL RPM: (delta pulses / 46 ticks) * 3000
+          // We use 3000.0f because (1 / 0.02 seconds) * 60 seconds = 3000
+          float rpm_actual = (delta * 3000.0f) / 46.0f;
 
-	          freq_out = 40.0f + (rpm_filtered * 0.015f); // The Growl
-	          if (freq_out > 350.0f) freq_out = 350.0f;     // Anti-whistle
+          // 2. Smooth the filter (0.92 keeps it steady, 0.08 reacts to changes)
+          rpm_filtered = 0.92f * rpm_filtered + 0.08f * rpm_actual;
 
-	          vol_out = 0.4f; // Fixed volume for testing
+          // 3. Adjust Pitch (Freq)
+          // We start at 20Hz (Deep Hum) and add 0.2Hz per RPM
+          // You might want to play with the 0.2f to find your "heavenly" sweet spot
+          freq_out = 20.0f + (rpm_filtered * 0.2f);
 
-	          printf("RPM: %d | Freq: %d Hz\r\n", (int)rpm_filtered, (int)freq_out);
-	      }
+          // 4. The "Rev Limiter"
+          if (freq_out > 1000.0f) freq_out = 1000.0f;
+
+          vol_out = 0.45f; // Constant volume for testing
+
+          // Check your Serial Monitor to see the "Real" RPM of the wheel
+          printf("Bike RPM: %d | Freq: %d Hz\r\n", (int)rpm_filtered, (int)freq_out);
+      }
 //	    // --- read throttle (ADC) ---
 //	    HAL_ADC_Start(&hadc1);
 //	    HAL_ADC_PollForConversion(&hadc1, 10);
@@ -247,7 +262,7 @@ int main(void)
 ////	      printf("i2s_half=%lu i2s_full=%lu\r\n", i2s_half, i2s_full);
 ////	    }
 //
-//	    HAL_Delay(5); // tiny delay so UART isn't spammed
+	    HAL_Delay(1); // tiny delay so UART isn't spammed
 
 
     /* USER CODE END WHILE */
