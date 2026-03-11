@@ -98,14 +98,14 @@ int _write(int file, char *ptr, int len)
 ////the pitch being set by the RPM
 static void FillAudioFrames(int startFrame, int frameCount)
 {
-  const float two_pi = 6.283185307f;
+	const float two_pi = 6.283185307f;
 
-  // LOCK THE FLOOR: If RPM calculation gives us < 40, force it to 40.
-  float f = freq_out;
-  if (f < 40.0f) f = 40.0f;
+	  // NEW LOCK: 0 RPM is now 50Hz.
+	  float f = freq_out;
+	  if (f < 50.0f) f = 50.0f;
 
-  // 1. High-end safety clamp
-  if (f > 1000.0f) f = 1000.0f;
+	  // High-end safety clamp remains
+	  if (f > 1000.0f) f = 1000.0f;
 
   float base_vol = vol_out;
   float t_val = throttle_val;
