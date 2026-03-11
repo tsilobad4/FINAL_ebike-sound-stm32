@@ -104,60 +104,58 @@ static void FillAudioFrames(int startFrame, int frameCount)
   float t_val = throttle_val;
 
   static float startup_timer = 0.0f;
-  const float startup_duration = 3.5f;
+  const float startup_duration = 4.0f;
 
-  static float ph_merge_a = 0.0f, ph_merge_b = 0.0f;
-  static float ph1 = 0.0f, ph1_25 = 0.0f, ph1_5 = 0.0f, ph_sub = 0.0f, ph_sub_detune = 0.0f, wobble_phase = 0.0f;
+  static float ph_pulse = 0.0f, ph_tone = 0.0f;
+  static float ph1 = 0.0f, ph1_25 = 0.0f, ph_sub1 = 0.0f, ph_sub2 = 0.0f;
 
   for (int n = 0; n < frameCount; n++)
   {
     float x_motor = 0.0f;
     float final_x = 0.0f;
 
-    // --- 1. LIVE MOTOR (Growl Logic) ---
+    // --- 1. GHOST GROWL MOTOR LOGIC ---
     ph1 += f_motor / AUDIO_FS; if (ph1 >= 1.0f) ph1 -= 1.0f;
     ph1_25 += (1.25f * f_motor) / AUDIO_FS; if (ph1_25 >= 1.0f) ph1_25 -= 1.0f;
-    ph1_5  += (1.50f * f_motor) / AUDIO_FS; if (ph1_5 >= 1.0f) ph1_5 -= 1.0f;
-    ph_sub += (0.50f * f_motor) / AUDIO_FS; if (ph_sub >= 1.0f) ph_sub -= 1.0f;
-    ph_sub_detune += (0.50f * f_motor * 1.008f) / AUDIO_FS; if (ph_sub_detune >= 1.0f) ph_sub_detune -= 1.0f;
 
-    float s1 = sinf(two_pi * ph1);
-    float sine_mix = (s1 + sinf(two_pi * ph1_25) + sinf(two_pi * ph1_5)) * 0.33f;
-    float deep_growl = ((ph_sub * 2.0f) - 1.0f + (ph_sub_detune * 2.0f) - 1.0f) * 0.5f;
-    x_motor = (sine_mix * (1.0f - (t_val * 0.45f))) + (deep_growl * (t_val * 0.45f));
+    // Sub-Harmonic Saws at 0.5x (Keep 'em deep)
+    ph_sub1 += (0.50f * f_motor) / AUDIO_FS; if (ph_sub1 >= 1.0f) ph_sub1 -= 1.0f;
+    ph_sub2 += (0.50f * f_motor * 1.005f) / AUDIO_FS; if (ph_sub2 >= 1.0f) ph_sub2 -= 1.0f;
 
-    // --- 2. THE LOUD CONVERGENCE ---
+    // Clean Motor: This stays at full strength now
+    float sine_mix = (sinf(two_pi * ph1) + sinf(two_pi * ph1_25) * 0.4f) * 0.7f;
+
+    // The Raw Sawtooth
+    float raw_saw_growl = ((ph_sub1 * 2.0f) - 1.0f + (ph_sub2 * 2.0f) - 1.0f) * 0.5f;
+
+    // --- THE FIX: 15% CEILING & CUBED RAMP ---
+    // Cubed mapping (t^3) makes the first half of the throttle pull nearly silent
+    float saw_mix = (t_val * t_val * t_val) * 0.15f;
+
+    // No more fading the clean sound! We just add the saw on top.
+    x_motor = sine_mix + (raw_saw_growl * saw_mix);
+
+    // --- 2. OPTION 1: THE PULSAR SURGE (UNCHANGED) ---
     if (startup_timer < startup_duration)
     {
       startup_timer += 1.0f / AUDIO_FS;
       float progress = startup_timer / startup_duration;
 
-      // Pitch Merge: 180Hz & 110Hz merging to 50Hz
-      float freq_a = 50.0f + (130.0f * (1.0f - progress));
-      float freq_b = 50.0f + (60.0f * (1.0f - progress));
+      float pulse_rate = 2.0f + (48.0f * (progress * progress));
+      ph_pulse += pulse_rate / AUDIO_FS; if (ph_pulse >= 1.0f) ph_pulse -= 1.0f;
 
-      ph_merge_a += freq_a / AUDIO_FS; if (ph_merge_a >= 1.0f) ph_merge_a -= 1.0f;
-      ph_merge_b += freq_b / AUDIO_FS; if (ph_merge_b >= 1.0f) ph_merge_b -= 1.0f;
+      float env = powf(sinf(two_pi * ph_pulse * 0.5f + 1.5f), 12.0f);
+      float tone_f = 60.0f - (10.0f * progress);
+      ph_tone += tone_f / AUDIO_FS; if (ph_tone >= 1.0f) ph_tone -= 1.0f;
 
-      // Volume: Fast swell to peak volume
-      float swell = progress * 1.5f;
-      if (swell > 1.0f) swell = 1.0f;
-
-      // Mix 3 layers for "Weight": Tone A, Tone B, and a sub-octave
-      float x_startup = (sinf(two_pi * ph_merge_a) * 0.5f +
-                         sinf(two_pi * ph_merge_b) * 0.4f +
-                         sinf(two_pi * ph_merge_b * 0.5f) * 0.3f); // Sub layer
-
+      float x_startup = (sinf(two_pi * ph_tone) + sinf(two_pi * ph_tone * 0.5f) * 0.6f) * env;
       final_x = (x_startup * (1.0f - progress)) + (x_motor * progress);
     }
     else { final_x = x_motor; }
 
-    // --- 3. MASTER OUTPUT (CRANKED) ---
-    // Floor is set to 0.4f for a strong headphone presence
-    float active_vol = (base_vol < 0.4f) ? 0.4f : base_vol;
-
-    // 32500 is the absolute red-line for 16-bit audio
-    int16_t sample = (int16_t)(final_x * active_vol * 32500.0f);
+    // --- 3. MASTER OUTPUT ---
+    float active_vol = (base_vol < 0.45f) ? 0.45f : base_vol;
+    int16_t sample = (int16_t)(final_x * active_vol * 32000.0f);
 
     int idx = (startFrame + n) * 2;
     i2s_tx[idx + 0] = sample; i2s_tx[idx + 1] = sample;
