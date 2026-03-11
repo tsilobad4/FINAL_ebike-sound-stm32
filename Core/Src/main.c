@@ -98,74 +98,69 @@ int _write(int file, char *ptr, int len)
 ////the pitch being set by the RPM
 static void FillAudioFrames(int startFrame, int frameCount)
 {
-	const float two_pi = 6.283185307f;
-
-	  // NEW LOCK: 0 RPM is now 50Hz.
-	  float f = freq_out;
-	  if (f < 50.0f) f = 50.0f;
-
-	  // High-end safety clamp remains
-	  if (f > 1000.0f) f = 1000.0f;
-
+  const float two_pi = 6.283185307f;
+  float f_motor = (freq_out < 50.0f) ? 50.0f : freq_out;
   float base_vol = vol_out;
   float t_val = throttle_val;
 
-  // Persistent Phase Trackers
-  static float chime_timer = 0.0f;
-  static float ph_c = 0.0f, ph_e = 0.0f, ph_g = 0.0f;
-  static float ph1 = 0.0f, ph_sub = 0.0f, ph_sub_detune = 0.0f;
-  static float ph1_25 = 0.0f, ph1_5 = 0.0f, wobble_phase = 0.0f;
+  static float startup_timer = 0.0f;
+  const float startup_duration = 3.5f;
+
+  static float ph_merge_a = 0.0f, ph_merge_b = 0.0f;
+  static float ph1 = 0.0f, ph1_25 = 0.0f, ph1_5 = 0.0f, ph_sub = 0.0f, ph_sub_detune = 0.0f, wobble_phase = 0.0f;
 
   for (int n = 0; n < frameCount; n++)
   {
-    float x = 0.0f;
+    float x_motor = 0.0f;
+    float final_x = 0.0f;
 
-    // --- MODE 1: STARTUP CHIME ---
-    if (chime_timer < 3.0f)
+    // --- 1. LIVE MOTOR (Growl Logic) ---
+    ph1 += f_motor / AUDIO_FS; if (ph1 >= 1.0f) ph1 -= 1.0f;
+    ph1_25 += (1.25f * f_motor) / AUDIO_FS; if (ph1_25 >= 1.0f) ph1_25 -= 1.0f;
+    ph1_5  += (1.50f * f_motor) / AUDIO_FS; if (ph1_5 >= 1.0f) ph1_5 -= 1.0f;
+    ph_sub += (0.50f * f_motor) / AUDIO_FS; if (ph_sub >= 1.0f) ph_sub -= 1.0f;
+    ph_sub_detune += (0.50f * f_motor * 1.008f) / AUDIO_FS; if (ph_sub_detune >= 1.0f) ph_sub_detune -= 1.0f;
+
+    float s1 = sinf(two_pi * ph1);
+    float sine_mix = (s1 + sinf(two_pi * ph1_25) + sinf(two_pi * ph1_5)) * 0.33f;
+    float deep_growl = ((ph_sub * 2.0f) - 1.0f + (ph_sub_detune * 2.0f) - 1.0f) * 0.5f;
+    x_motor = (sine_mix * (1.0f - (t_val * 0.45f))) + (deep_growl * (t_val * 0.45f));
+
+    // --- 2. THE LOUD CONVERGENCE ---
+    if (startup_timer < startup_duration)
     {
-      chime_timer += 1.0f / AUDIO_FS;
-      ph_c += 261.63f / AUDIO_FS; if (ph_c >= 1.0f) ph_c -= 1.0f;
-      ph_e += 329.63f / AUDIO_FS; if (ph_e >= 1.0f) ph_e -= 1.0f;
-      ph_g += 391.99f / AUDIO_FS; if (ph_g >= 1.0f) ph_g -= 1.0f;
+      startup_timer += 1.0f / AUDIO_FS;
+      float progress = startup_timer / startup_duration;
 
-      float c_vol = (chime_timer < 0.4f) ? (chime_timer * 2.5f) : (1.0f - ((chime_timer - 0.4f) / 2.6f));
-      x = (sinf(two_pi * ph_c) + sinf(two_pi * ph_e) + sinf(two_pi * ph_g)) * 0.33f * c_vol;
+      // Pitch Merge: 180Hz & 110Hz merging to 50Hz
+      float freq_a = 50.0f + (130.0f * (1.0f - progress));
+      float freq_b = 50.0f + (60.0f * (1.0f - progress));
+
+      ph_merge_a += freq_a / AUDIO_FS; if (ph_merge_a >= 1.0f) ph_merge_a -= 1.0f;
+      ph_merge_b += freq_b / AUDIO_FS; if (ph_merge_b >= 1.0f) ph_merge_b -= 1.0f;
+
+      // Volume: Fast swell to peak volume
+      float swell = progress * 1.5f;
+      if (swell > 1.0f) swell = 1.0f;
+
+      // Mix 3 layers for "Weight": Tone A, Tone B, and a sub-octave
+      float x_startup = (sinf(two_pi * ph_merge_a) * 0.5f +
+                         sinf(two_pi * ph_merge_b) * 0.4f +
+                         sinf(two_pi * ph_merge_b * 0.5f) * 0.3f); // Sub layer
+
+      final_x = (x_startup * (1.0f - progress)) + (x_motor * progress);
     }
-    // --- MODE 2: MOTOR RUNNING ---
-    else
-    {
-      // 1. Update ONLY the necessary phases
-      ph1    += f / AUDIO_FS;           if (ph1 >= 1.0f) ph1 -= 1.0f;
-      ph1_25 += (1.25f * f) / AUDIO_FS; if (ph1_25 >= 1.0f) ph1_25 -= 1.0f;
-      ph1_5  += (1.5f * f) / AUDIO_FS;  if (ph1_5 >= 1.0f) ph1_5 -= 1.0f;
-      ph_sub += (0.5f * f) / AUDIO_FS;  if (ph_sub >= 1.0f) ph_sub -= 1.0f;
-      ph_sub_detune += (0.5f * f * 1.008f) / AUDIO_FS; if (ph_sub_detune >= 1.0f) ph_sub_detune -= 1.0f;
+    else { final_x = x_motor; }
 
-      // 2. MIX THE CHORD
-      float s1 = sinf(two_pi * ph1);
-      float sine_mix = (s1 + sinf(two_pi * ph1_25) + sinf(two_pi * ph1_5)) * 0.33f;
+    // --- 3. MASTER OUTPUT (CRANKED) ---
+    // Floor is set to 0.4f for a strong headphone presence
+    float active_vol = (base_vol < 0.4f) ? 0.4f : base_vol;
 
-      // 3. THE DEEP GROWL (Sawtooths)
-      float saw1 = (ph_sub * 2.0f) - 1.0f;
-      float saw2 = (ph_sub_detune * 2.0f) - 1.0f;
-      float deep_growl = (saw1 + saw2) * 0.5f;
-
-      // 4. TEXTURE BLEND
-      float growl_intensity = t_val * 0.45f;
-      x = (sine_mix * (1.0f - growl_intensity)) + (deep_growl * growl_intensity);
-
-      // 5. THE WOBBLE
-      wobble_phase += (5.0f + (t_val * 20.0f)) / AUDIO_FS;
-      if (wobble_phase >= 1.0f) wobble_phase -= 1.0f;
-      x *= (1.0f - (0.15f * (0.5f + 0.5f * sinf(two_pi * wobble_phase))));
-    }
-
-    // 6. SAFE OUTPUT
-    int16_t sample = (int16_t)(x * base_vol * 18000.0f);
+    // 32500 is the absolute red-line for 16-bit audio
+    int16_t sample = (int16_t)(final_x * active_vol * 32500.0f);
 
     int idx = (startFrame + n) * 2;
-    i2s_tx[idx + 0] = sample;
-    i2s_tx[idx + 1] = sample;
+    i2s_tx[idx + 0] = sample; i2s_tx[idx + 1] = sample;
   }
 }
 
