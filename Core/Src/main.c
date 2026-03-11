@@ -18,12 +18,12 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <math.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
 #include <stdio.h>
+#include <math.h>
 
 /* USER CODE END Includes */
 
@@ -95,23 +95,26 @@ int _write(int file, char *ptr, int len)
   return len;
 }
 
-//the pitch being set by the RPM
+////the pitch being set by the RPM
 static void FillAudioFrames(int startFrame, int frameCount)
 {
   const float two_pi = 6.283185307f;
+
+  // LOCK THE FLOOR: If RPM calculation gives us < 40, force it to 40.
   float f = freq_out;
+  if (f < 40.0f) f = 40.0f;
+
+  // 1. High-end safety clamp
+  if (f > 1000.0f) f = 1000.0f;
+
   float base_vol = vol_out;
   float t_val = throttle_val;
 
-  if (f < 20.0f) f = 20.0f;
-  if (f > 1200.0f) f = 1200.0f;
-
-  // Persistent trackers
+  // Persistent Phase Trackers
   static float chime_timer = 0.0f;
   static float ph_c = 0.0f, ph_e = 0.0f, ph_g = 0.0f;
-  static float ph1 = 0.0f, ph2 = 0.0f, ph3 = 0.0f, ph4 = 0.0f, ph8 = 0.0f;
-  static float ph_sub = 0.0f, ph1_25 = 0.0f, ph1_5 = 0.0f; // Added ph1_25 here
-  static float wobble_phase = 0.0f;
+  static float ph1 = 0.0f, ph_sub = 0.0f, ph_sub_detune = 0.0f;
+  static float ph1_25 = 0.0f, ph1_5 = 0.0f, wobble_phase = 0.0f;
 
   for (int n = 0; n < frameCount; n++)
   {
@@ -126,51 +129,66 @@ static void FillAudioFrames(int startFrame, int frameCount)
       ph_g += 391.99f / AUDIO_FS; if (ph_g >= 1.0f) ph_g -= 1.0f;
 
       float c_vol = (chime_timer < 0.4f) ? (chime_timer * 2.5f) : (1.0f - ((chime_timer - 0.4f) / 2.6f));
-      float shimmer = 0.85f + 0.15f * sinf(two_pi * chime_timer * 2.0f);
-
-      x = (sinf(two_pi * ph_c) + sinf(two_pi * ph_e) + sinf(two_pi * ph_g)) * 0.33f * c_vol * shimmer;
-
-      int16_t sample = (int16_t)(x * 25000.0f);
-      int idx = (startFrame + n) * 2;
-      i2s_tx[idx + 0] = sample; i2s_tx[idx + 1] = sample;
+      x = (sinf(two_pi * ph_c) + sinf(two_pi * ph_e) + sinf(two_pi * ph_g)) * 0.33f * c_vol;
     }
     // --- MODE 2: MOTOR RUNNING ---
     else
     {
-      // 1. Update EVERY phase so we can swap sounds on the fly
-      ph_sub += (0.5f * f) / AUDIO_FS;  if (ph_sub >= 1.0f) ph_sub -= 1.0f;
+      // 1. Update ONLY the necessary phases
       ph1    += f / AUDIO_FS;           if (ph1 >= 1.0f) ph1 -= 1.0f;
-      ph1_25 += (1.25f * f) / AUDIO_FS; if (ph1_25 >= 1.0f) ph1_25 -= 1.0f; // Fix: Added tracking
+      ph1_25 += (1.25f * f) / AUDIO_FS; if (ph1_25 >= 1.0f) ph1_25 -= 1.0f;
       ph1_5  += (1.5f * f) / AUDIO_FS;  if (ph1_5 >= 1.0f) ph1_5 -= 1.0f;
-      ph2    += (2.0f * f) / AUDIO_FS;  if (ph2 >= 1.0f) ph2 -= 1.0f;
-      ph3    += (3.0f * f) / AUDIO_FS;  if (ph3 >= 1.0f) ph3 -= 1.0f;
-      ph4    += (4.0f * f) / AUDIO_FS;  if (ph4 >= 1.0f) ph4 -= 1.0f;
-      ph8    += (8.0f * f) / AUDIO_FS;  if (ph8 >= 1.0f) ph8 -= 1.0f;
+      ph_sub += (0.5f * f) / AUDIO_FS;  if (ph_sub >= 1.0f) ph_sub -= 1.0f;
+      ph_sub_detune += (0.5f * f * 1.008f) / AUDIO_FS; if (ph_sub_detune >= 1.0f) ph_sub_detune -= 1.0f;
 
-      // --- OPTION D: THE CHIME-MOTOR (The Angelic Choice) ---
-      float sine_mix = (sinf(two_pi * ph1) + sinf(two_pi * ph1_25) + sinf(two_pi * ph1_5)) * 0.33f;
+      // 2. MIX THE CHORD
+      float s1 = sinf(two_pi * ph1);
+      float sine_mix = (s1 + sinf(two_pi * ph1_25) + sinf(two_pi * ph1_5)) * 0.33f;
 
-      // The Sharpness Addition (Sawtooth)
-      float saw_wave = (ph1 * 2.0f) - 1.0f;
+      // 3. THE DEEP GROWL (Sawtooths)
+      float saw1 = (ph_sub * 2.0f) - 1.0f;
+      float saw2 = (ph_sub_detune * 2.0f) - 1.0f;
+      float deep_growl = (saw1 + saw2) * 0.5f;
 
-      // Crossfade: Sine (Smooth) -> Saw (Aggressive) based on throttle
-      x = (sine_mix * (1.0f - (t_val * 0.45f))) + (saw_wave * (t_val * 0.45f));
+      // 4. TEXTURE BLEND
+      float growl_intensity = t_val * 0.45f;
+      x = (sine_mix * (1.0f - growl_intensity)) + (deep_growl * growl_intensity);
 
-      // 3. THE WOBBLE
+      // 5. THE WOBBLE
       wobble_phase += (5.0f + (t_val * 20.0f)) / AUDIO_FS;
       if (wobble_phase >= 1.0f) wobble_phase -= 1.0f;
-      float modulation = 1.0f - (0.2f * (0.5f + 0.5f * sinf(two_pi * wobble_phase)));
-
-      // 4. FINAL OUTPUT
-      int16_t sample = (int16_t)(x * base_vol * modulation * 28000.0f);
-      int idx = (startFrame + n) * 2;
-      i2s_tx[idx + 0] = sample; i2s_tx[idx + 1] = sample;
+      x *= (1.0f - (0.15f * (0.5f + 0.5f * sinf(two_pi * wobble_phase))));
     }
+
+    // 6. SAFE OUTPUT
+    int16_t sample = (int16_t)(x * base_vol * 18000.0f);
+
+    int idx = (startFrame + n) * 2;
+    i2s_tx[idx + 0] = sample;
+    i2s_tx[idx + 1] = sample;
   }
 }
 
+//static void FillAudioFrames(int startFrame, int frameCount)
+//{
+//  static uint32_t counter = 0;
+//
+//  for (int n = 0; n < frameCount; n++)
+//  {
+//    counter++;
+//
+//    // Toggle every 40 samples (approx 400Hz beep)
+//    // We use a safe volume of 8000
+//    int16_t sample = ((counter / 40) % 2) ? 8000 : -8000;
+//
+//    int idx = (startFrame + n) * 2;
+//    i2s_tx[idx + 0] = sample;
+//    i2s_tx[idx + 1] = sample;
+//  }
+//}
+
 /* USER CODE END 0 */
-// 1 to 4 v
+
 /**
   * @brief  The application entry point.
   * @retval int
@@ -207,12 +225,22 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   // starting the DMA
-  FillAudioFrames(0, FRAMES);
+//  FillAudioFrames(0, FRAMES);
+//
+//
+//  HAL_I2S_Transmit_DMA(&hi2s2, (uint16_t*)i2s_tx, FRAMES * 2);			// start streaming this bugger out of I2S2 forever using DMA
 
+  // 1. Clear the buffer
+    for(int i=0; i<FRAMES*2; i++) { i2s_tx[i] = 0; }
 
-  HAL_I2S_Transmit_DMA(&hi2s2, (uint16_t*)i2s_tx, FRAMES * 2);			// start streaming this bugger out of I2S2 forever using DMA
+    // 2. Initial fill
+    FillAudioFrames(0, FRAMES);
 
+    // 3. Wait for power to stabilize
+    HAL_Delay(500);
 
+    // 4. Start the DMA
+    HAL_I2S_Transmit_DMA(&hi2s2, (uint16_t*)i2s_tx, FRAMES * 2);
 
   /* USER CODE END 2 */
 
@@ -221,10 +249,21 @@ int main(void)
   while (1)
   {
 	  // 1. THE AUTO-RESTART WATCHDOG
-	        if (HAL_I2S_GetState(&hi2s2) != HAL_I2S_STATE_BUSY_TX)
-	        {
-	            HAL_I2S_Transmit_DMA(&hi2s2, (uint16_t*)i2s_tx, FRAMES * 2);
-	        }
+	  // Check if the Overrun flag is set (this is what kills the sound)
+	  if (__HAL_I2S_GET_FLAG(&hi2s2, I2S_FLAG_OVR))
+	  {
+	      // 1. Clear the error flag
+	      __HAL_I2S_CLEAR_OVRFLAG(&hi2s2);
+
+	      // 2. Stop the DMA and I2S completely to reset the "Mouth"
+	      HAL_I2S_DMAStop(&hi2s2);
+
+	      // 3. Kick it back to life
+	      HAL_I2S_Transmit_DMA(&hi2s2, (uint16_t*)i2s_tx, FRAMES * 2);
+
+	      // Optional: Print a message so you know it happened
+	      // printf("I2S Resuscitated!\r\n");
+	  }
 
 	        // 2. READ THROTTLE (ADC) - Do this every loop
 	        HAL_ADC_Start(&hadc1);
@@ -257,25 +296,25 @@ int main(void)
 	        uint32_t now = HAL_GetTick();
 	        if (now - last_rpm_time_ms >= 20)
 	        {
-	            last_rpm_time_ms = now;
+	        	last_rpm_time_ms = now;
 
-	            uint32_t current = pulse_count;
-	            float delta = (float)(current - last_pulse_count);
-	            last_pulse_count = current;
+	        	uint32_t current = pulse_count;
+	        	float delta = (float)(current - last_pulse_count);
+	        	last_pulse_count = current;
 
-	            // Convert pulses to RPM (46 ticks per rev)
-	            float rpm_actual = (delta * 3000.0f) / 46.0f;
-	            rpm_filtered = (0.92f * rpm_filtered) + (0.08f * rpm_actual);
+	        	float rpm_actual = (delta * 3000.0f) / 46.0f;
+	        	rpm_filtered = (0.92f * rpm_filtered) + (0.08f * rpm_actual);
 
-	            // Calculate frequency based on filtered RPM PLUS the Throttle Position
-	            // Adding (throttle_val * 150.0f) makes the pitch jump when you twist the grip!
-	            freq_out = 20.0f + (rpm_filtered * 0.2f) + (throttle_val * 150.0f);
+	        	// --- FIXED PITCH LOGIC ---
+	        	// 0 RPM = 50Hz, 700 RPM = 200Hz
+	        	freq_out = 50.0f + (rpm_filtered * 0.2142f);
 
-	            if (freq_out > 1200.0f) freq_out = 1200.0f; // Slightly higher cap for the extra rev
+	        	// Safety Cap: Don't let the motor scream past 1000Hz
+	        	if (freq_out > 1000.0f) freq_out = 1000.0f;
 
-	            // Print status for debugging
-	            printf("RPM: %d | Freq: %d Hz | Thr: %d%%\r\n",
-	                   (int)rpm_filtered, (int)freq_out, (int)(throttle_val * 100));
+	        	// The Serial Monitor will now show a steady Freq even when you twist the grip
+	        	printf("RPM: %d | Freq: %d Hz | Thr: %d%%\r\n",
+	        	   (int)rpm_filtered, (int)freq_out, (int)(throttle_val * 100));
 	        }
 	            HAL_Delay(1); // tiny delay so UART isn't spammed
 
@@ -510,7 +549,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI4_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 3, 0);
   HAL_NVIC_EnableIRQ(EXTI4_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
