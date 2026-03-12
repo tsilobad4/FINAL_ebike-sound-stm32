@@ -139,7 +139,7 @@ static void FillAudioFrames(int startFrame, int frameCount)
 
     // --- THE FIX: 15% CEILING & CUBED RAMP ---
     // Cubed mapping (t^3) makes the first half of the throttle pull nearly silent
-    float saw_mix = (0.02f + (t_val * t_val)) * 0.15f;
+    float saw_mix = (0.01f + (t_val * t_val * t_val)) * 0.08f;
 
     // No more fading the clean sound! We just add the saw on top.
     x_motor = sine_mix + (raw_saw_growl * saw_mix);
