@@ -73,6 +73,15 @@ volatile uint32_t i2s_half = 0, i2s_full = 0;
 float throttle_old = 0.0f;
 float bite_factor = 0.0f; // This will track the "punch"
 
+// --- THROTTLE CALIBRATION ---
+// Sound starts at 1.0V
+#define THROTTLE_START_SOUND_VOLTS  1.0f
+// 100% sound is reached at 4.2V (gives headroom below 4.5V max)
+#define THROTTLE_FULL_SOUND_VOLTS   4.2f
+
+// Optional: Simple Moving Average Filter for smoother throttle
+#define THROTTLE_FILTER_SAMPLES      10
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -130,7 +139,7 @@ static void FillAudioFrames(int startFrame, int frameCount)
 
     // --- THE FIX: 15% CEILING & CUBED RAMP ---
     // Cubed mapping (t^3) makes the first half of the throttle pull nearly silent
-    float saw_mix = (t_val * t_val * t_val) * 0.15f;
+    float saw_mix = (0.02f + (t_val * t_val)) * 0.15f;
 
     // No more fading the clean sound! We just add the saw on top.
     x_motor = sine_mix + (raw_saw_growl * saw_mix);
@@ -241,50 +250,63 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  // 1. THE AUTO-RESTART WATCHDOG
-	  // Check if the Overrun flag is set (this is what kills the sound)
-	  if (__HAL_I2S_GET_FLAG(&hi2s2, I2S_FLAG_OVR))
-	  {
-	      // 1. Clear the error flag
-	      __HAL_I2S_CLEAR_OVRFLAG(&hi2s2);
+	  float throttle_voltage = 0.0f;
 
-	      // 2. Stop the DMA and I2S completely to reset the "Mouth"
-	      HAL_I2S_DMAStop(&hi2s2);
+	  // 1. THE AUTO-RESTART WATCHDOG (Keep this as is)
+	      if (__HAL_I2S_GET_FLAG(&hi2s2, I2S_FLAG_OVR))
+	      {
+	          __HAL_I2S_CLEAR_OVRFLAG(&hi2s2);
+	          HAL_I2S_DMAStop(&hi2s2);
+	          HAL_I2S_Transmit_DMA(&hi2s2, (uint16_t*)i2s_tx, FRAMES * 2);
+	      }
 
-	      // 3. Kick it back to life
-	      HAL_I2S_Transmit_DMA(&hi2s2, (uint16_t*)i2s_tx, FRAMES * 2);
+	      // 2. READ & CALIBRATE THROTTLE
+	      HAL_ADC_Start(&hadc1);
+	      if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
+	      {
+	          uint32_t adc_raw = HAL_ADC_GetValue(&hadc1);
 
-	      // Optional: Print a message so you know it happened
-	      // printf("I2S Resuscitated!\r\n");
-	  }
+	          // --- CALIBRATION STEP ---
+	          // Convert ADC (0-4095) to Voltage (0-3.3V)
+	          throttle_voltage = ((float)adc_raw / 4095.0f) * 3.3f;
 
-	        // 2. READ THROTTLE (ADC) - Do this every loop
-	        HAL_ADC_Start(&hadc1);
-	        if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
-	        {
-	            uint32_t adc_raw = HAL_ADC_GetValue(&hadc1);
-	            float target_throttle = (float)adc_raw / 4095.0f;
+	          // Map 1.0V -> 0% and 3.0V+ -> 100%
+	          // (Note: Using 3.0V as the target since 4.5V from the bike
+	          // will be clamped to ~3.9V by our diode, and we want 100% to be easy to hit)
+	          float target_throttle = 0.0f;
 
-	            // Calculate how FAST the throttle is moving (The "Kick")
-	            float throttle_diff = target_throttle - throttle_old;
-	            if (throttle_diff > 0) {
-	                // If twisting UP fast, add bite (scaled by how fast you move)
-	                bite_factor += throttle_diff * 2.5f;
-	            }
-	            throttle_old = target_throttle;
+	          if (throttle_voltage <= 1.0f) {
+	              target_throttle = 0.0f; // Deadzone: Still at 1V
+	          }
+	          else if (throttle_voltage >= 3.0f) {
+	              target_throttle = 1.0f; // Ceiling: Full sound at 3V (safely below the 3.9V clamp)
+	          }
+	          else {
+	              // Math: Scale the 1.0V to 3.0V range into 0.0 to 1.0
+	              target_throttle = (throttle_voltage - 1.0f) / (3.0f - 1.0f);
+	          }
 
-	            // Decay the bite factor back to 0 (the "settle" effect)
-	            bite_factor *= 0.95f;
-	            if (bite_factor > 0.5f) bite_factor = 0.5f; // Cap the boost
+	          // Constrain to 0.0 - 1.0 range
+	          if (target_throttle > 1.0f) target_throttle = 1.0f;
+	          if (target_throttle < 0.0f) target_throttle = 0.0f;
 
-	            // Smooth the throttle_val normally
-	            throttle_val = (0.9f * throttle_val) + (0.1f * target_throttle);
+	          // --- BITE & SMOOTHING (Your existing logic) ---
+	          float throttle_diff = target_throttle - throttle_old;
+	          if (throttle_diff > 0) {
+	              bite_factor += throttle_diff * 2.5f;
+	          }
+	          throttle_old = target_throttle;
+	          bite_factor *= 0.95f;
+	          if (bite_factor > 0.5f) bite_factor = 0.5f;
 
-	            // Final Volume = Steady volume + the "Bite" boost
-	            vol_out = 0.15f + (throttle_val * 0.45f) + bite_factor;
-	            if (vol_out > 0.9f) vol_out = 0.9f; // Don't clip!
-	        }
-	        HAL_ADC_Stop(&hadc1);
+	          // Smooth the final throttle_val (Moving toward the calibrated target)
+	          throttle_val = (0.9f * throttle_val) + (0.1f * target_throttle);
+
+	          vol_out = 0.15f + (throttle_val * 0.45f) + bite_factor;
+	          if (vol_out > 0.9f) vol_out = 0.9f;
+	      }
+	      HAL_ADC_Stop(&hadc1);
+
 	        // 3. BIKE RPM & PITCH CALCULATION (Every 20ms)
 	        uint32_t now = HAL_GetTick();
 	        if (now - last_rpm_time_ms >= 20)
@@ -306,8 +328,8 @@ int main(void)
 	        	if (freq_out > 1000.0f) freq_out = 1000.0f;
 
 	        	// The Serial Monitor will now show a steady Freq even when you twist the grip
-	        	printf("RPM: %d | Freq: %d Hz | Thr: %d%%\r\n",
-	        	   (int)rpm_filtered, (int)freq_out, (int)(throttle_val * 100));
+	        	printf("V_raw: %d | RPM: %d | Freq: %dHz | Thr: %d%%\r\n",
+	        	       (int)(throttle_voltage * 100), (int)rpm_filtered, (int)freq_out, (int)(throttle_val * 100));
 	        }
 	            HAL_Delay(1); // tiny delay so UART isn't spammed
 
