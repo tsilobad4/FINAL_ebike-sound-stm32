@@ -108,7 +108,7 @@ int _write(int file, char *ptr, int len)
 static void FillAudioFrames(int startFrame, int frameCount)
 {
   const float two_pi = 6.283185307f;
-  float f_motor = (freq_out < 50.0f) ? 50.0f : freq_out;
+  float f_motor = (freq_out < 60.0f) ? 60.0f : freq_out;
   float base_vol = vol_out;
   float t_val = throttle_val;
 
@@ -139,7 +139,7 @@ static void FillAudioFrames(int startFrame, int frameCount)
 
     // --- THE FIX: 15% CEILING & CUBED RAMP ---
     // Cubed mapping (t^3) makes the first half of the throttle pull nearly silent
-    float saw_mix = (0.01f + (t_val * t_val * t_val)) * 0.08f;
+    float saw_mix = (0.01f + (t_val * t_val * t_val)) * 0.15f;
 
     // No more fading the clean sound! We just add the saw on top.
     x_motor = sine_mix + (raw_saw_growl * saw_mix);
@@ -311,21 +311,22 @@ int main(void)
 	        uint32_t now = HAL_GetTick();
 	        if (now - last_rpm_time_ms >= 20)
 	        {
+	        	// --- UPDATED PITCH LOGIC ---
+	        	// 0 RPM = 60Hz, 650 RPM = 220Hz
 	        	last_rpm_time_ms = now;
 
 	        	uint32_t current = pulse_count;
 	        	float delta = (float)(current - last_pulse_count);
 	        	last_pulse_count = current;
 
-	        	float rpm_actual = (delta * 3000.0f) / 46.0f;
+	        	float rpm_actual = (delta * 3000.0f) / 32.0f;
 	        	rpm_filtered = (0.92f * rpm_filtered) + (0.08f * rpm_actual);
 
-	        	// --- FIXED PITCH LOGIC ---
-	        	// 0 RPM = 50Hz, 700 RPM = 200Hz
-	        	freq_out = 50.0f + (rpm_filtered * 0.2142f);
+	        	// Updated formula: 60Hz base + (rpm * 0.24615)
+	        	freq_out = 60.0f + (rpm_filtered * 0.24615f);
 
-	        	// Safety Cap: Don't let the motor scream past 1000Hz
-	        	if (freq_out > 1000.0f) freq_out = 1000.0f;
+	        	// Safety Cap
+	        	if (freq_out > 500.0f) freq_out = 500.0f;
 
 	        	// The Serial Monitor will now show a steady Freq even when you twist the grip
 	        	printf("V_raw: %d | RPM: %d | Freq: %dHz | Thr: %d%%\r\n",
